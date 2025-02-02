@@ -1,0 +1,163 @@
+#include "ZoomSDKAudioRawDataDelegate.h"
+#include "meeting_service_components/meeting_participants_ctrl_interface.h"
+#include "meeting_service_interface.h"
+
+#include <iostream>
+#include <sstream>
+#include <fstream>
+#include <iomanip> // For std::put_time
+
+ZoomSDKAudioRawDataDelegate::ZoomSDKAudioRawDataDelegate(bool useMixedAudio, IMeetingService* meetingService)
+    : m_useMixedAudio(useMixedAudio), m_meetingService(meetingService), m_recordingStarted(false), m_currentNodeId(0) {}
+
+void ZoomSDKAudioRawDataDelegate::onOneWayAudioRawDataReceived(AudioRawData* data, uint32_t node_id) {
+    std::stringstream path;
+    path << m_dir << "/node-" << node_id << ".pcm";
+    writeToFile(path.str(), data);
+
+    std::cout << "[DEBUG] onOneWayAudioRawDataReceived called" << std::endl;
+    std::cout << "[DEBUG] Node ID: " << node_id << std::endl;
+
+    IUserInfo* userInfo = getUserInfoByNodeId(node_id);
+    if (userInfo) {
+        std::string userName = userInfo->GetUserName();
+        bool isH323User = userInfo->IsH323User();
+
+        if (isH323User) {
+            auto now = std::chrono::steady_clock::now();
+
+            if (!m_recordingStarted) {
+                m_startTime = now;
+                m_speakerStartTimes[node_id] = m_startTime;
+                auto start = std::chrono::duration_cast<std::chrono::milliseconds>(m_startTime.time_since_epoch()).count();
+                std::cout << "Recording started, Initial Start_Time: " << formatTimestamp(start) << std::endl;
+                m_currentSpeaker = userName;
+                m_recordingStarted = true;
+                m_currentNodeId = node_id;
+            } else if (node_id != m_currentNodeId || m_currentSpeaker != userName) {
+                logSpeakerChange(node_id, userName);
+                m_currentNodeId = node_id;
+                m_currentSpeaker = userName;
+                m_startTime = now;
+                m_speakerStartTimes[node_id] = m_startTime;
+            }
+        }
+    } else {
+        std::cout << "User Info not found for Node ID: " << node_id << std::endl;
+    }
+}
+
+void ZoomSDKAudioRawDataDelegate::logSpeakerChange(uint32_t node_id, const std::string& newSpeaker) {
+    if (!m_currentSpeaker.empty() && m_speakerStartTimes.find(m_currentNodeId) != m_speakerStartTimes.end()) {
+        auto end_time = std::chrono::steady_clock::now();
+        auto start = std::chrono::duration_cast<std::chrono::milliseconds>(m_speakerStartTimes[m_currentNodeId].time_since_epoch()).count();
+        auto end = std::chrono::duration_cast<std::chrono::milliseconds>(end_time.time_since_epoch()).count();
+
+        // Log only if the speaker has actually changed
+        if (m_currentSpeaker != newSpeaker) {
+            std::cout << "UserName: " << m_currentSpeaker << ", Start_Time: " << formatTimestamp(start) << ", End_Time: " << formatTimestamp(end) << std::endl;
+            logSpeakerChangeToFile(m_currentSpeaker, start, end);
+
+            // Update the start time for the new speaker
+            m_speakerStartTimes[node_id] = end_time;
+        }
+    }
+}
+
+void ZoomSDKAudioRawDataDelegate::logSpeakerChangeToFile(const std::string& speaker, long long start_time, long long end_time) {
+    std::size_t dot = m_filename.find_last_of('.');
+
+    // Extract the part of the filename before the dot
+    std::string path_file = m_filename.substr(0, dot);
+
+    // Open the file for appending
+    std::ofstream file(path_file + ".txt", std::ios::app);
+
+    if (file.is_open()) {
+        file << "UserName: " << speaker << ", Start_Time: " << formatTimestamp(start_time);
+        if (end_time >= 0) {
+            file << ", End_Time: " << formatTimestamp(end_time);
+        }
+        file << std::endl;
+        file.close();
+    } else {
+        std::cout << "[ERROR] Failed to open log file." << std::endl;
+    }
+}
+
+std::string ZoomSDKAudioRawDataDelegate::formatTimestamp(long long milliseconds) {
+    // Convert milliseconds to seconds
+    long long total_seconds = milliseconds / 1000;
+    long long hours = total_seconds / 3600;
+    long long minutes = (total_seconds % 3600) / 60;
+    long long seconds = total_seconds % 60;
+    long long millis = milliseconds % 1000;
+
+    std::stringstream ss;
+    ss << std::setw(2) << std::setfill('0') << hours << ":"
+       << std::setw(2) << std::setfill('0') << minutes << ":"
+       << std::setw(2) << std::setfill('0') << seconds << "."
+       << std::setw(3) << std::setfill('0') << millis;
+
+    return ss.str();
+}
+
+ZOOMSDK::IUserInfo* ZoomSDKAudioRawDataDelegate::getUserInfoByNodeId(uint32_t nodeId) {
+    IMeetingParticipantsController* participantsController = m_meetingService->GetMeetingParticipantsController();
+    return participantsController ? participantsController->GetUserByUserID(nodeId) : nullptr;
+}
+
+void ZoomSDKAudioRawDataDelegate::onShareAudioRawDataReceived(AudioRawData* data) {
+    std::stringstream ss;
+    ss << "Shared Audio Raw data: " << data->GetBufferLen() << "b at " << data->GetSampleRate() << "Hz";
+    Log::info(ss.str());
+}
+
+void ZoomSDKAudioRawDataDelegate::writeToFile(const std::string& path, AudioRawData* data) {
+    std::ofstream file(path, std::ios::out | std::ios::binary | std::ios::app);
+
+    if (!file.is_open()) {
+        std::cerr << "Failed to open audio file path: " << path << std::endl;
+        return;
+    }
+
+    file.write(data->GetBuffer(), data->GetBufferLen());
+    file.flush();
+    file.close();
+
+    std::stringstream ss;
+    ss << "Writing " << data->GetBufferLen() << "b to " << path << " at " << data->GetSampleRate() << "Hz";
+    std::cout << "[DEBUG] " << ss.str() << std::endl;
+}
+
+void ZoomSDKAudioRawDataDelegate::onMixedAudioRawDataReceived(AudioRawData *data, uint32_t node_id) {
+    if (!m_useMixedAudio) return;
+
+    if (m_dir.empty()) {
+        std::cerr << "Output Directory cannot be blank" << std::endl;
+        return;
+    }
+
+    if (m_filename.empty())
+        m_filename = "test.pcm";
+
+    std::stringstream path;
+    path << m_dir << "/" << m_filename;
+
+    std::cout << "[DEBUG] onMixedAudioRawDataReceived called" << std::endl;
+    std::cout << "[DEBUG] Node ID: " << node_id << std::endl;
+
+    writeToFile(path.str(), data);
+}
+
+void ZoomSDKAudioRawDataDelegate::setDir(const std::string& dir) {
+    m_dir = dir;
+}
+
+void ZoomSDKAudioRawDataDelegate::setFilename(const std::string& filename) {
+    m_filename = filename;
+}
+
+void ZoomSDKAudioRawDataDelegate::onOneWayInterpreterAudioRawDataReceived(AudioRawData* data, const zchar_t* pLanguageName) {
+    // Implementation here
+}
